@@ -2,6 +2,7 @@ import torch
 import torch.utils.data
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 import os
 import json
@@ -12,6 +13,14 @@ from utils import option
 from data import dataset
 from model import HTR_VT
 from functools import partial
+
+# Wandb for experiment tracking
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. Install with: pip install wandb")
 
 
 def compute_loss(args, model, image, batch_size, criterion, text, length):
@@ -36,6 +45,19 @@ def main():
 
     logger = utils.get_logger(args.save_dir)
     logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
+    
+    # Initialize wandb if enabled
+    if args.use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project="HTR-Mask",
+            name=args.exp_name,
+            config=vars(args),
+            dir=args.save_dir,
+        )
+        logger.info("Wandb initialized successfully!")
+    elif args.use_wandb and not WANDB_AVAILABLE:
+        logger.warning("Wandb requested but not available. Using tensorboard only.")
+    
     writer = SummaryWriter(args.save_dir)
 
     model = HTR_VT.create_model(nb_cls=args.nb_cls, img_size=args.img_size[::-1])
@@ -75,7 +97,10 @@ def main():
 
     #### ---- train & eval ---- ####
 
-    for nb_iter in range(1, args.total_iter):
+    # Create progress bar
+    pbar = tqdm(range(1, args.total_iter), desc="Training", unit="iter")
+    
+    for nb_iter in pbar:
 
         optimizer, current_lr = utils.update_lr_cos(nb_iter, args.warm_up_iter, args.total_iter, args.max_lr, optimizer)
 
@@ -92,14 +117,30 @@ def main():
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
         train_loss += loss.item()
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'lr': f'{current_lr:.6f}',
+            'best_cer': f'{best_cer:.4f}' if best_cer < 1e+6 else 'N/A'
+        })
 
         if nb_iter % args.print_iter == 0:
             train_loss_avg = train_loss / args.print_iter
 
-            logger.info(f'Iter : {nb_iter} \t LR : {current_lr:0.5f} \t training loss : {train_loss_avg:0.5f} \t ' )
+            logger.info(f'Iter : {nb_iter} \t LR : {current_lr:0.5f} \t training loss : {train_loss_avg:0.5f}')
 
             writer.add_scalar('./Train/lr', current_lr, nb_iter)
             writer.add_scalar('./Train/train_loss', train_loss_avg, nb_iter)
+            
+            # Log to wandb
+            if args.use_wandb and WANDB_AVAILABLE:
+                wandb.log({
+                    'train/loss': train_loss_avg,
+                    'train/lr': current_lr,
+                    'iter': nb_iter,
+                })
+            
             train_loss = 0.0
 
         if nb_iter % args.eval_iter == 0:
@@ -131,14 +172,34 @@ def main():
                     torch.save(checkpoint, os.path.join(args.save_dir, 'best_WER.pth'))
 
                 logger.info(
-                    f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f} \t ')
+                    f'Val. loss : {val_loss:0.3f} \t CER : {val_cer:0.4f} \t WER : {val_wer:0.4f}')
 
                 writer.add_scalar('./VAL/CER', val_cer, nb_iter)
                 writer.add_scalar('./VAL/WER', val_wer, nb_iter)
                 writer.add_scalar('./VAL/bestCER', best_cer, nb_iter)
                 writer.add_scalar('./VAL/bestWER', best_wer, nb_iter)
                 writer.add_scalar('./VAL/val_loss', val_loss, nb_iter)
+                
+                # Log validation metrics to wandb
+                if args.use_wandb and WANDB_AVAILABLE:
+                    wandb.log({
+                        'val/loss': val_loss,
+                        'val/cer': val_cer,
+                        'val/wer': val_wer,
+                        'val/best_cer': best_cer,
+                        'val/best_wer': best_wer,
+                        'iter': nb_iter,
+                    })
+                
                 model.train()
+    
+    # Close progress bar
+    pbar.close()
+    
+    # Finish wandb run
+    if args.use_wandb and WANDB_AVAILABLE:
+        wandb.finish()
+        logger.info("Wandb run finished.")
 
 
 if __name__ == '__main__':
