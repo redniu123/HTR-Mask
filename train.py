@@ -2,7 +2,7 @@ import torch
 import torch.utils.data
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 import os
@@ -26,15 +26,16 @@ except ImportError:
 
 
 def compute_loss(args, model, image, batch_size, criterion, text, length, use_amp=True):
-    with autocast(device_type='cuda', enabled=use_amp):
+    """计算 CTC Loss，使用 autocast 加速前向传播"""
+    with autocast(enabled=use_amp):
         preds = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
         preds_size = torch.IntTensor([preds.size(1)] * batch_size).cuda()
         preds = preds.permute(1, 0, 2).log_softmax(2)
 
-        # CTC loss needs float32, so we cast here
-        torch.backends.cudnn.enabled = False
-        loss = criterion(preds.float(), text.cuda(), preds_size, length.cuda()).mean()
-        torch.backends.cudnn.enabled = True
+    # CTC loss 需要 float32，在 autocast 外计算
+    torch.backends.cudnn.enabled = False
+    loss = criterion(preds.float(), text.cuda(), preds_size, length.cuda()).mean()
+    torch.backends.cudnn.enabled = True
     return loss
 
 
@@ -108,10 +109,7 @@ def main():
     criterion = torch.nn.CTCLoss(reduction="none", zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
-    # Mixed Precision Training (AMP)
-    # 注意：SAM 优化器需要两个 scaler，因为它有两步更新
-    scaler1 = GradScaler('cuda', enabled=args.use_amp)
-    scaler2 = GradScaler('cuda', enabled=args.use_amp)
+    # Mixed Precision Training (AMP) - 只加速前向传播，不改变 SAM 梯度逻辑
     if args.use_amp:
         logger.info("Mixed Precision Training (AMP) enabled - utilizing Tensor Cores!")
     else:
@@ -136,7 +134,7 @@ def main():
         text, length = converter.encode(batch[1])
         batch_size = image.size(0)
 
-        # First forward-backward pass with AMP
+        # First forward-backward pass with AMP (autocast 只加速前向)
         loss = compute_loss(
             args,
             model,
@@ -147,15 +145,11 @@ def main():
             length,
             use_amp=args.use_amp,
         )
-        scaler1.scale(loss).backward()
-
-        # SAM first step - unscale gradients and take first step
-        scaler1.unscale_(optimizer)
+        loss.backward()
         optimizer.first_step(zero_grad=True)
-        scaler1.update()
 
         # Second forward-backward pass with AMP
-        loss2 = compute_loss(
+        compute_loss(
             args,
             model,
             image,
@@ -164,13 +158,8 @@ def main():
             text,
             length,
             use_amp=args.use_amp,
-        )
-        scaler2.scale(loss2).backward()
-
-        # SAM second step with scaler
-        scaler2.unscale_(optimizer)
+        ).backward()
         optimizer.second_step(zero_grad=True)
-        scaler2.update()
 
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
