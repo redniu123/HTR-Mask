@@ -44,52 +44,126 @@ from PIL import Image
 
 def format_IAM_line():
     """
-    Format the IAM dataset at line level with the commonly used split (6,482 for train, 976 for validation and 2,915 for test)
+    Format the IAM dataset at line level using .ln files for split and xml.tgz for labels.
+    Expected files in ./iam/:
+        - lines.tgz: line images
+        - xml.tgz: XML files with labels
+        - train.ln, val.ln, test.ln: dataset split (image filename lists)
     """
     source_folder = "./iam"
     target_folder = "./iam/lines"
-    tar_filename = "lines.tgz"
-    line_folder_path = os.path.join(target_folder, "lines")
 
-    tar_path = os.path.join(source_folder, tar_filename)
-    if not os.path.isfile(tar_path):
-        print("error - {} not found".format(tar_path))
-        exit(-1)
+    # Check required files
+    lines_tgz = os.path.join(source_folder, "lines.tgz")
+    xml_tgz = os.path.join(source_folder, "xml.tgz")
+    for f in [lines_tgz, xml_tgz]:
+        if not os.path.isfile(f):
+            print("error - {} not found".format(f))
+            exit(-1)
 
-    os.makedirs(target_folder, exist_ok=True)
-    tar = tarfile.open(tar_path)
+    # Clean and create target folder
+    if os.path.isdir(target_folder):
+        shutil.rmtree(target_folder)
+    os.makedirs(target_folder)
+
+    # Extract archives
+    line_folder_path = os.path.join(target_folder, "lines_temp")
+    xml_folder_path = os.path.join(target_folder, "xml_temp")
+
+    print("Extracting lines.tgz...")
+    tar = tarfile.open(lines_tgz)
     tar.extractall(line_folder_path)
     tar.close()
 
-    set_names = ["train", "valid", "test"]
+    print("Extracting xml.tgz...")
+    tar = tarfile.open(xml_tgz)
+    tar.extractall(xml_folder_path)
+    tar.close()
+
+    # Build label dictionary from XML files
+    print("Building label dictionary from XML files...")
+    labels_dict = {}  # line_id -> text
+    for xml_file in os.listdir(xml_folder_path):
+        if not xml_file.endswith(".xml"):
+            continue
+        xml_path = os.path.join(xml_folder_path, xml_file)
+        try:
+            xml_root = ET.parse(xml_path).getroot()
+            # Find all line elements in handwritten-part
+            for hw_part in xml_root.findall("handwritten-part"):
+                for line in hw_part.findall("line"):
+                    line_id = line.attrib.get("id")
+                    text = line.attrib.get("text")
+                    if line_id and text:
+                        labels_dict[line_id] = text
+        except Exception as e:
+            print(f"Warning: Failed to parse {xml_file}: {e}")
+
+    print(f"Loaded {len(labels_dict)} labels from XML files")
+
+    # Process each split
+    set_files = {"train": "train.ln", "valid": "val.ln", "test": "test.ln"}
     gt = {"train": dict(), "valid": dict(), "test": dict()}
     charset = set()
 
-    for set_name in set_names:
-        id = 0
+    for set_name, ln_file in set_files.items():
+        ln_path = os.path.join(source_folder, ln_file)
+        if not os.path.isfile(ln_path):
+            print(f"Warning: {ln_path} not found, skipping {set_name}")
+            continue
+
         current_folder = os.path.join(target_folder, set_name)
         os.makedirs(current_folder, exist_ok=True)
-        xml_path = os.path.join(source_folder, "{}.xml".format(set_name))
-        xml_root = ET.parse(xml_path).getroot()
-        for page in xml_root:
-            name = page.attrib.get("FileName").split("/")[-1].split(".")[0]
-            img_fold_path = os.path.join(line_folder_path, name.split("-")[0], name)
-            img_paths = [
-                os.path.join(img_fold_path, p)
-                for p in sorted(os.listdir(img_fold_path))
-            ]
-            for i, line in enumerate(page[2]):
-                label = line.attrib.get("Value")
-                img_name = "{}_{}.png".format(set_name, id)
-                gt[set_name][img_name] = {
-                    "text": label,
-                }
-                charset = charset.union(set(label))
-                new_path = os.path.join(current_folder, img_name)
-                os.replace(img_paths[i], new_path)
-                id += 1
 
+        # Read image list from .ln file
+        with open(ln_path, "r") as f:
+            image_list = [line.strip() for line in f if line.strip()]
+
+        print(f"Processing {set_name}: {len(image_list)} images")
+
+        idx = 0
+        for img_filename in image_list:
+            # img_filename format: a02-102-00.png
+            # line_id: a02-102-00
+            # form_id: a02-102
+            # source path: lines_temp/a02/a02-102/a02-102-00.png
+            line_id = img_filename.replace(".png", "")
+            parts = line_id.split("-")
+            if len(parts) < 3:
+                print(f"Warning: Invalid filename format: {img_filename}")
+                continue
+
+            folder1 = parts[0]  # a02
+            folder2 = "-".join(parts[:2])  # a02-102
+
+            src_path = os.path.join(line_folder_path, folder1, folder2, img_filename)
+
+            if not os.path.isfile(src_path):
+                print(f"Warning: Image not found: {src_path}")
+                continue
+
+            # Get label
+            label = labels_dict.get(line_id)
+            if label is None:
+                print(f"Warning: No label for {line_id}")
+                continue
+
+            # Copy image and record
+            new_img_name = f"{set_name}_{idx}.png"
+            dst_path = os.path.join(current_folder, new_img_name)
+            shutil.copy2(src_path, dst_path)
+
+            gt[set_name][new_img_name] = {"text": label}
+            charset = charset.union(set(label))
+            idx += 1
+
+        print(f"  Processed {idx} images for {set_name}")
+
+    # Clean up temp folders
     shutil.rmtree(line_folder_path)
+    shutil.rmtree(xml_folder_path)
+
+    # Save labels
     with open(os.path.join(target_folder, "labels.pkl"), "wb") as f:
         pickle.dump(
             {
@@ -98,6 +172,8 @@ def format_IAM_line():
             },
             f,
         )
+
+    print("IAM dataset formatting complete!")
 
 
 def format_READ2016_line():
@@ -217,7 +293,9 @@ def pkl2txt(dataset_name):
             for k, v in a["ground_truth"][i].items():
                 head = k.split(".")[0]
                 text = v["text"].replace("¬", "")
-                with open(f"./read2016/lines/{head}.txt", "a", encoding="utf-8") as t:
+                with open(
+                    f"./{dataset_name}/lines/{head}.txt", "a", encoding="utf-8"
+                ) as t:
                     t.write(text)
 
 
@@ -253,12 +331,12 @@ def move_files_and_delete_folders(parent_folder):
 
 
 if __name__ == "__main__":
-    format_READ2016_line()
-    pkl2txt("read2016")
-    move_files_and_delete_folders("./read2016/lines")
+    # format_READ2016_line()
+    # pkl2txt("read2016")
+    # move_files_and_delete_folders("./read2016/lines")
 
-    # format_IAM_line()
-    # pkl2txt('iam')
-    # move_files_and_delete_folders("./iam/lines")
+    format_IAM_line()
+    pkl2txt("iam")
+    move_files_and_delete_folders("./iam/lines")
 
     # format_LAM_line()
