@@ -5,7 +5,5 @@ __pycache__/
 venv/
 .env
 *.pth  # 除非权重很小，否则不要上传模型文件
-data/iam/lines
-data/LAM/lines
-data/read2016/lines  # 数据集通常不上传
+data/*/lines/  # 忽略所有数据集的 lines 目录
 *.tgz
