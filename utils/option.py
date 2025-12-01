@@ -18,6 +18,8 @@ def get_args_parser():
     parser.add_argument('--weight-decay', default=5e-1, type=float, help='weight decay')
     parser.add_argument('--use-wandb', action='store_true', default=True, help='use wandb for experiment tracking (default: True)')
     parser.add_argument('--no-wandb', action='store_false', dest='use_wandb', help='disable wandb, use tensorboard only')
+    parser.add_argument('--use-amp', action='store_true', default=True, help='use Automatic Mixed Precision for faster training (default: True)')
+    parser.add_argument('--no-amp', action='store_false', dest='use_amp', help='disable AMP, use full precision')
     parser.add_argument('--exp-name',type=str, default='IAM_HTR_ORIGAMI_NET', help='experimental name (save dir will be out_dir + exp_name)')
     parser.add_argument('--seed', default=123, type=int, help='seed for initializing training. ')
 

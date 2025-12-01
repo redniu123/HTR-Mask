@@ -2,6 +2,7 @@ import torch
 import torch.utils.data
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 import os
@@ -23,15 +24,16 @@ except ImportError:
     print("Warning: wandb not installed. Install with: pip install wandb")
 
 
-def compute_loss(args, model, image, batch_size, criterion, text, length):
-    preds = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
-    preds = preds.float()
-    preds_size = torch.IntTensor([preds.size(1)] * batch_size).cuda()
-    preds = preds.permute(1, 0, 2).log_softmax(2)
-
-    torch.backends.cudnn.enabled = False
-    loss = criterion(preds, text.cuda(), preds_size, length.cuda()).mean()
-    torch.backends.cudnn.enabled = True
+def compute_loss(args, model, image, batch_size, criterion, text, length, use_amp=True):
+    with autocast(enabled=use_amp):
+        preds = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
+        preds_size = torch.IntTensor([preds.size(1)] * batch_size).cuda()
+        preds = preds.permute(1, 0, 2).log_softmax(2)
+        
+        # CTC loss needs float32, so we cast here
+        torch.backends.cudnn.enabled = False
+        loss = criterion(preds.float(), text.cuda(), preds_size, length.cuda()).mean()
+        torch.backends.cudnn.enabled = True
     return loss
 
 
@@ -91,6 +93,13 @@ def main():
     optimizer = sam.SAM(model.parameters(), torch.optim.AdamW, lr=1e-7, betas=(0.9, 0.99), weight_decay=args.weight_decay)
     criterion = torch.nn.CTCLoss(reduction='none', zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
+    
+    # Mixed Precision Training (AMP)
+    scaler = GradScaler(enabled=args.use_amp)
+    if args.use_amp:
+        logger.info("Mixed Precision Training (AMP) enabled - utilizing Tensor Cores!")
+    else:
+        logger.info("Mixed Precision Training (AMP) disabled")
 
     best_cer, best_wer = 1e+6, 1e+6
     train_loss = 0.0
@@ -109,11 +118,24 @@ def main():
         image = batch[0].cuda()
         text, length = converter.encode(batch[1])
         batch_size = image.size(0)
-        loss = compute_loss(args, model, image, batch_size, criterion, text, length)
-        loss.backward()
+        
+        # First forward-backward pass with AMP
+        loss = compute_loss(args, model, image, batch_size, criterion, text, length, use_amp=args.use_amp)
+        scaler.scale(loss).backward()
+        
+        # SAM first step
+        scaler.unscale_(optimizer)
         optimizer.first_step(zero_grad=True)
-        compute_loss(args, model, image, batch_size, criterion, text, length).backward()
+        
+        # Second forward-backward pass with AMP
+        loss2 = compute_loss(args, model, image, batch_size, criterion, text, length, use_amp=args.use_amp)
+        scaler.scale(loss2).backward()
+        
+        # SAM second step with scaler
+        scaler.unscale_(optimizer)
         optimizer.second_step(zero_grad=True)
+        scaler.update()
+        
         model.zero_grad()
         model_ema.update(model, num_updates=nb_iter / 2)
         train_loss += loss.item()
