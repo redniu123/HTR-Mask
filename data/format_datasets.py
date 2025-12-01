@@ -49,6 +49,8 @@ def format_IAM_line():
         - lines.tgz: line images
         - xml.tgz: XML files with labels
         - train.ln, val.ln, test.ln: dataset split (image filename lists)
+
+    Output: ./iam/lines/ with original filenames (e.g., a02-102-00.png, a02-102-00.txt)
     """
     source_folder = "./iam"
     target_folder = "./iam/lines"
@@ -101,69 +103,88 @@ def format_IAM_line():
 
     print(f"Loaded {len(labels_dict)} labels from XML files")
 
-    # Process each split
-    set_files = {"train": "train.ln", "valid": "val.ln", "test": "test.ln"}
-    gt = {"train": dict(), "valid": dict(), "test": dict()}
+    # Collect all images from .ln files
+    ln_files = ["train.ln", "val.ln", "test.ln"]
+    all_images = set()
+    for ln_file in ln_files:
+        ln_path = os.path.join(source_folder, ln_file)
+        if os.path.isfile(ln_path):
+            with open(ln_path, "r") as f:
+                for line in f:
+                    if line.strip():
+                        all_images.add(line.strip())
+
+    print(f"Total images in .ln files: {len(all_images)}")
+
+    # Process all images - keep original filenames
+    processed = 0
+    skipped = 0
     charset = set()
 
-    for set_name, ln_file in set_files.items():
-        ln_path = os.path.join(source_folder, ln_file)
-        if not os.path.isfile(ln_path):
-            print(f"Warning: {ln_path} not found, skipping {set_name}")
+    for img_filename in all_images:
+        # img_filename format: a02-102-00.png
+        # line_id: a02-102-00
+        line_id = img_filename.replace(".png", "")
+        parts = line_id.split("-")
+        if len(parts) < 3:
+            print(f"Warning: Invalid filename format: {img_filename}")
+            skipped += 1
             continue
 
-        current_folder = os.path.join(target_folder, set_name)
-        os.makedirs(current_folder, exist_ok=True)
+        folder1 = parts[0]  # a02
+        folder2 = "-".join(parts[:2])  # a02-102
 
-        # Read image list from .ln file
-        with open(ln_path, "r") as f:
-            image_list = [line.strip() for line in f if line.strip()]
+        src_path = os.path.join(line_folder_path, folder1, folder2, img_filename)
 
-        print(f"Processing {set_name}: {len(image_list)} images")
+        if not os.path.isfile(src_path):
+            print(f"Warning: Image not found: {src_path}")
+            skipped += 1
+            continue
 
-        idx = 0
-        for img_filename in image_list:
-            # img_filename format: a02-102-00.png
-            # line_id: a02-102-00
-            # form_id: a02-102
-            # source path: lines_temp/a02/a02-102/a02-102-00.png
-            line_id = img_filename.replace(".png", "")
-            parts = line_id.split("-")
-            if len(parts) < 3:
-                print(f"Warning: Invalid filename format: {img_filename}")
-                continue
+        # Get label
+        label = labels_dict.get(line_id)
+        if label is None:
+            print(f"Warning: No label for {line_id}")
+            skipped += 1
+            continue
 
-            folder1 = parts[0]  # a02
-            folder2 = "-".join(parts[:2])  # a02-102
+        # Copy image with original filename
+        dst_img_path = os.path.join(target_folder, img_filename)
+        shutil.copy2(src_path, dst_img_path)
 
-            src_path = os.path.join(line_folder_path, folder1, folder2, img_filename)
+        # Write label to .txt file with same name
+        txt_filename = img_filename.replace(".png", ".txt")
+        dst_txt_path = os.path.join(target_folder, txt_filename)
+        with open(dst_txt_path, "w", encoding="utf-8") as f:
+            f.write(label)
 
-            if not os.path.isfile(src_path):
-                print(f"Warning: Image not found: {src_path}")
-                continue
+        charset = charset.union(set(label))
+        processed += 1
 
-            # Get label
-            label = labels_dict.get(line_id)
-            if label is None:
-                print(f"Warning: No label for {line_id}")
-                continue
-
-            # Copy image and record
-            new_img_name = f"{set_name}_{idx}.png"
-            dst_path = os.path.join(current_folder, new_img_name)
-            shutil.copy2(src_path, dst_path)
-
-            gt[set_name][new_img_name] = {"text": label}
-            charset = charset.union(set(label))
-            idx += 1
-
-        print(f"  Processed {idx} images for {set_name}")
+    print(f"Processed {processed} images, skipped {skipped}")
 
     # Clean up temp folders
     shutil.rmtree(line_folder_path)
     shutil.rmtree(xml_folder_path)
 
-    # Save labels
+    # Save labels.pkl for compatibility
+    gt = {"train": dict(), "valid": dict(), "test": dict()}
+    for ln_file, set_name in [
+        ("train.ln", "train"),
+        ("val.ln", "valid"),
+        ("test.ln", "test"),
+    ]:
+        ln_path = os.path.join(source_folder, ln_file)
+        if os.path.isfile(ln_path):
+            with open(ln_path, "r") as f:
+                for line in f:
+                    img_filename = line.strip()
+                    if img_filename:
+                        line_id = img_filename.replace(".png", "")
+                        label = labels_dict.get(line_id)
+                        if label:
+                            gt[set_name][img_filename] = {"text": label}
+
     with open(os.path.join(target_folder, "labels.pkl"), "wb") as f:
         pickle.dump(
             {
@@ -335,8 +356,6 @@ if __name__ == "__main__":
     # pkl2txt("read2016")
     # move_files_and_delete_folders("./read2016/lines")
 
-    format_IAM_line()
-    pkl2txt("iam")
-    move_files_and_delete_folders("./iam/lines")
+    format_IAM_line()  # IAM: 直接生成正确格式，不需要额外处理
 
     # format_LAM_line()
