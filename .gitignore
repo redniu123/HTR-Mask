@@ -8,3 +8,4 @@ venv/
 data/iam/lines
 data/LAM/lines
 data/read2016/lines  # 数据集通常不上传
+*.tgz

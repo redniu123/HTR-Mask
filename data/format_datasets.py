@@ -62,11 +62,7 @@ def format_IAM_line():
     tar.close()
 
     set_names = ["train", "valid", "test"]
-    gt = {
-        "train": dict(),
-        "valid": dict(),
-        "test": dict()
-    }
+    gt = {"train": dict(), "valid": dict(), "test": dict()}
     charset = set()
 
     for set_name in set_names:
@@ -78,7 +74,10 @@ def format_IAM_line():
         for page in xml_root:
             name = page.attrib.get("FileName").split("/")[-1].split(".")[0]
             img_fold_path = os.path.join(line_folder_path, name.split("-")[0], name)
-            img_paths = [os.path.join(img_fold_path, p) for p in sorted(os.listdir(img_fold_path))]
+            img_paths = [
+                os.path.join(img_fold_path, p)
+                for p in sorted(os.listdir(img_fold_path))
+            ]
             for i, line in enumerate(page[2]):
                 label = line.attrib.get("Value")
                 img_name = "{}_{}.png".format(set_name, id)
@@ -92,10 +91,13 @@ def format_IAM_line():
 
     shutil.rmtree(line_folder_path)
     with open(os.path.join(target_folder, "labels.pkl"), "wb") as f:
-         pickle.dump({
-             "ground_truth": gt,
-             "charset": sorted(list(charset)),
-         }, f)
+        pickle.dump(
+            {
+                "ground_truth": gt,
+                "charset": sorted(list(charset)),
+            },
+            f,
+        )
 
 
 def format_READ2016_line():
@@ -118,33 +120,45 @@ def format_READ2016_line():
         tar.extractall(target_folder)
         tar.close()
 
-    os.rename(os.path.join(target_folder, "PublicData", "Training"), os.path.join(target_folder, "train"))
-    os.rename(os.path.join(target_folder, "PublicData", "Validation"), os.path.join(target_folder, "valid"))
-    os.rename(os.path.join(target_folder, "Test-ICFHR-2016"), os.path.join(target_folder, "test"))
+    os.rename(
+        os.path.join(target_folder, "PublicData", "Training"),
+        os.path.join(target_folder, "train"),
+    )
+    os.rename(
+        os.path.join(target_folder, "PublicData", "Validation"),
+        os.path.join(target_folder, "valid"),
+    )
+    os.rename(
+        os.path.join(target_folder, "Test-ICFHR-2016"),
+        os.path.join(target_folder, "test"),
+    )
     os.rmdir(os.path.join(target_folder, "PublicData"))
-    for set_name in ["train", "valid", ]:
+    for set_name in [
+        "train",
+        "valid",
+    ]:
         for filename in os.listdir(os.path.join(target_folder, set_name, "Images")):
             filepath = os.path.join(target_folder, set_name, "Images", filename)
             if os.path.isfile(filepath):
                 os.rename(filepath, os.path.join(target_folder, set_name, filename))
         os.rmdir(os.path.join(target_folder, set_name, "Images"))
 
-    gt = {
-        "train": dict(),
-        "valid": dict(),
-        "test": dict()
-    }
+    gt = {"train": dict(), "valid": dict(), "test": dict()}
 
     charset = set()
     for set_name in ["train", "valid", "test"]:
         img_fold_path = os.path.join(target_folder, set_name)
-        xml_fold_path = os.path.join(target_folder, set_name, "page")
+        # train/valid 的 XML 在 page/page 目录下，test 的 XML 在 page 目录下
+        if set_name in ["train", "valid"]:
+            xml_fold_path = os.path.join(target_folder, set_name, "page", "page")
+        else:
+            xml_fold_path = os.path.join(target_folder, set_name, "page")
         i = 0
         for xml_file_name in sorted(os.listdir(xml_fold_path)):
             if xml_file_name.split(".")[-1] != "xml":
                 continue
             filename = xml_file_name.split(".")[0]
-            img_path = os.path.join(img_fold_path, filename+".JPG")
+            img_path = os.path.join(img_fold_path, filename + ".JPG")
             xml_file_path = os.path.join(xml_fold_path, xml_file_name)
             xml_root = ET.parse(xml_file_path).getroot()
             img = np.array(Image.open(img_path))
@@ -165,34 +179,46 @@ def format_READ2016_line():
                             line_label = sub[0].text
                     if line_label is None:
                         continue
-                    top, bottom, left, right = np.min(y_points), np.max(y_points), np.min(x_points), np.max(x_points)
+                    top, bottom, left, right = (
+                        np.min(y_points),
+                        np.max(y_points),
+                        np.min(x_points),
+                        np.max(x_points),
+                    )
                     new_img_name = "{}_{}.jpeg".format(set_name, i)
                     new_img_path = os.path.join(img_fold_path, new_img_name)
-                    curr_img = img[top:bottom + 1, left:right + 1]
+                    curr_img = img[top : bottom + 1, left : right + 1]
                     Image.fromarray(curr_img).save(new_img_path)
-                    gt[set_name][new_img_name] = {"text": line_label, }
+                    gt[set_name][new_img_name] = {
+                        "text": line_label,
+                    }
                     charset = charset.union(line_label)
                     i += 1
                     line_label = None
             os.remove(img_path)
-        shutil.rmtree(xml_fold_path)
+        # 删除整个 page 目录（train/valid 的 page 目录包含嵌套的 page/page）
+        page_folder = os.path.join(target_folder, set_name, "page")
+        shutil.rmtree(page_folder)
 
     with open(os.path.join(target_folder, "labels.pkl"), "wb") as f:
-        pickle.dump({
-            "ground_truth": gt,
-            "charset": sorted(list(charset)),
-        }, f)
-
+        pickle.dump(
+            {
+                "ground_truth": gt,
+                "charset": sorted(list(charset)),
+            },
+            f,
+        )
 
 
 def pkl2txt(dataset_name):
-    for i in ['train', 'valid', 'test']:
+    for i in ["train", "valid", "test"]:
         with open((f"./{dataset_name}/lines/labels.pkl"), "rb") as f:
             a = pickle.load(f)
-            for k, v in a['ground_truth'][i].items():
-                head = k.split('.')[0]
-                text = v['text'].replace('¬', '')
-                with open(f'./read2016/lines/{head}.txt', 'a') as t: t.write(text)
+            for k, v in a["ground_truth"][i].items():
+                head = k.split(".")[0]
+                text = v["text"].replace("¬", "")
+                with open(f"./read2016/lines/{head}.txt", "a", encoding="utf-8") as t:
+                    t.write(text)
 
 
 def move_files_and_delete_folders(parent_folder):
@@ -226,15 +252,13 @@ def move_files_and_delete_folders(parent_folder):
         print(f"Moved all files from {folder} and deleted the folder.")
 
 
-
 if __name__ == "__main__":
-
     format_READ2016_line()
-    pkl2txt('read2016')
+    pkl2txt("read2016")
     move_files_and_delete_folders("./read2016/lines")
 
-    #format_IAM_line()
-    #pkl2txt('iam')
-    #move_files_and_delete_folders("./iam/lines")
+    # format_IAM_line()
+    # pkl2txt('iam')
+    # move_files_and_delete_folders("./iam/lines")
 
     # format_LAM_line()
