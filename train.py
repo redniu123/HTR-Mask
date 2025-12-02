@@ -2,7 +2,6 @@ import torch
 import torch.utils.data
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 import os
@@ -25,16 +24,15 @@ except ImportError:
     print("Warning: wandb not installed. Install with: pip install wandb")
 
 
-def compute_loss(args, model, image, batch_size, criterion, text, length, use_amp=True):
-    """计算 CTC Loss，使用 autocast 加速前向传播"""
-    with autocast(enabled=use_amp):
-        preds = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
-        preds_size = torch.IntTensor([preds.size(1)] * batch_size).cuda()
-        preds = preds.permute(1, 0, 2).log_softmax(2)
+def compute_loss(args, model, image, batch_size, criterion, text, length):
+    """计算 CTC Loss (标准 FP32 模式)"""
+    preds = model(image, args.mask_ratio, args.max_span_length, use_masking=True)
+    preds = preds.float()  # CTC Loss 要求 float32
+    preds_size = torch.IntTensor([preds.size(1)] * batch_size).cuda()
+    preds = preds.permute(1, 0, 2).log_softmax(2)
 
-    # CTC loss 需要 float32，在 autocast 外计算
     torch.backends.cudnn.enabled = False
-    loss = criterion(preds.float(), text.cuda(), preds_size, length.cuda()).mean()
+    loss = criterion(preds, text.cuda(), preds_size, length.cuda()).mean()
     torch.backends.cudnn.enabled = True
     return loss
 
@@ -109,12 +107,6 @@ def main():
     criterion = torch.nn.CTCLoss(reduction="none", zero_infinity=True)
     converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
-    # Mixed Precision Training (AMP) - 只加速前向传播，不改变 SAM 梯度逻辑
-    if args.use_amp:
-        logger.info("Mixed Precision Training (AMP) enabled - utilizing Tensor Cores!")
-    else:
-        logger.info("Mixed Precision Training (AMP) disabled")
-
     best_cer, best_wer = 1e6, 1e6
     train_loss = 0.0
 
@@ -157,7 +149,7 @@ def main():
         text, length = converter.encode(batch[1])
         batch_size = image.size(0)
 
-        # First forward-backward pass with AMP (autocast 只加速前向)
+        # First forward-backward pass (标准 FP32)
         loss = compute_loss(
             args,
             model,
@@ -166,7 +158,6 @@ def main():
             criterion,
             text,
             length,
-            use_amp=args.use_amp,
         )
 
         # === [Safety] NaN/Inf Loss Protection ===
@@ -182,7 +173,7 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
         optimizer.first_step(zero_grad=True)
 
-        # Second forward-backward pass with AMP
+        # Second forward-backward pass (标准 FP32)
         compute_loss(
             args,
             model,
@@ -191,7 +182,6 @@ def main():
             criterion,
             text,
             length,
-            use_amp=args.use_amp,
         ).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
         optimizer.second_step(zero_grad=True)
