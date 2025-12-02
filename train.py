@@ -122,20 +122,20 @@ def main():
     checkpoint_path = os.path.join(args.save_dir, "best_CER.pth")
     if os.path.exists(checkpoint_path):
         logger.info(f"Found checkpoint at {checkpoint_path}, resuming training...")
-        checkpoint = torch.load(checkpoint_path, map_location='cuda')
-        
+        checkpoint = torch.load(checkpoint_path, map_location="cuda")
+
         # Load model weights
-        model.load_state_dict(checkpoint['model'])
+        model.load_state_dict(checkpoint["model"])
         logger.info("Loaded model weights from checkpoint")
-        
+
         # Load EMA weights
-        if 'state_dict_ema' in checkpoint:
-            model_ema.ema.load_state_dict(checkpoint['state_dict_ema'])
+        if "state_dict_ema" in checkpoint:
+            model_ema.ema.load_state_dict(checkpoint["state_dict_ema"])
             logger.info("Loaded EMA weights from checkpoint")
-        
+
         # NOTE: We intentionally do NOT load optimizer state to reset momentum
         logger.info("Optimizer state NOT loaded (momentum reset for fresh start)")
-        
+
         del checkpoint  # Free memory
         torch.cuda.empty_cache()
     else:
@@ -168,6 +168,16 @@ def main():
             length,
             use_amp=args.use_amp,
         )
+
+        # === [Safety] NaN/Inf Loss Protection ===
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.warning(
+                f"⚠️ Warning: NaN/Inf loss detected at Iter {nb_iter}. Skipping batch to prevent crash."
+            )
+            optimizer.zero_grad()
+            continue
+        # ========================================
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
         optimizer.first_step(zero_grad=True)
