@@ -118,6 +118,29 @@ def main():
     best_cer, best_wer = 1e6, 1e6
     train_loss = 0.0
 
+    # ---- Resume from checkpoint if exists ----
+    checkpoint_path = os.path.join(args.save_dir, "best_CER.pth")
+    if os.path.exists(checkpoint_path):
+        logger.info(f"Found checkpoint at {checkpoint_path}, resuming training...")
+        checkpoint = torch.load(checkpoint_path, map_location='cuda')
+        
+        # Load model weights
+        model.load_state_dict(checkpoint['model'])
+        logger.info("Loaded model weights from checkpoint")
+        
+        # Load EMA weights
+        if 'state_dict_ema' in checkpoint:
+            model_ema.ema.load_state_dict(checkpoint['state_dict_ema'])
+            logger.info("Loaded EMA weights from checkpoint")
+        
+        # NOTE: We intentionally do NOT load optimizer state to reset momentum
+        logger.info("Optimizer state NOT loaded (momentum reset for fresh start)")
+        
+        del checkpoint  # Free memory
+        torch.cuda.empty_cache()
+    else:
+        logger.info("No checkpoint found, starting training from scratch")
+
     #### ---- train & eval ---- ####
 
     # Create progress bar
@@ -146,6 +169,7 @@ def main():
             use_amp=args.use_amp,
         )
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
         optimizer.first_step(zero_grad=True)
 
         # Second forward-backward pass with AMP
@@ -159,6 +183,7 @@ def main():
             length,
             use_amp=args.use_amp,
         ).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Gradient clipping
         optimizer.second_step(zero_grad=True)
 
         model.zero_grad()
