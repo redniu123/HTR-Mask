@@ -14,6 +14,7 @@ def get_args_parser():
     parser.add_argument('--total-iter', default=100000, type=int, help='nb of total iterations for training')
     parser.add_argument('--warm-up-iter', default=1000, type=int, help='nb of iterations for warm-up')
     parser.add_argument('--print-iter', default=100, type=int, help='nb of total iterations to print information')
+    parser.add_argument('--save-latest-interval', default=1000, type=int, help='save latest.pth every N iterations')
     parser.add_argument('--max-lr', default=1e-3, type=float, help='learning rate')
     parser.add_argument('--weight-decay', default=5e-1, type=float, help='weight decay')
     parser.add_argument('--use-wandb', action='store_true', default=True, help='use wandb for experiment tracking (default: True)')

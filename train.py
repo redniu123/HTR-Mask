@@ -244,13 +244,19 @@ def main():
     lambda_attn = getattr(args, "lambda_attn", 1.0)
     lambda_lang = getattr(args, "lambda_lang", 1.0)
 
-    # ---- Resume from checkpoint if exists ----
-    checkpoint_path = os.path.join(args.save_dir, "best_CER.pth")
-    if os.path.exists(checkpoint_path):
-        logger.info(f"Found checkpoint at {checkpoint_path}, resuming training...")
-        checkpoint = torch.load(checkpoint_path, map_location="cuda")
+    # ============================================================
+    # Auto-Resume Logic (优先从 latest.pth 恢复)
+    # ============================================================
+    start_iter = 1
+    resume_path = os.path.join(args.save_dir, "latest.pth")
+    best_cer_path = os.path.join(args.save_dir, "best_CER.pth")
 
-        # Load model weights (strict=False 以支持新旧模型兼容)
+    if os.path.exists(resume_path):
+        # 优先从 latest.pth 恢复（包含完整的训练状态）
+        logger.info(f"🚀 Resuming from latest checkpoint: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location="cuda")
+
+        # Load model weights
         try:
             model.load_state_dict(checkpoint["model"], strict=True)
             logger.info("Loaded model weights from checkpoint (strict)")
@@ -270,10 +276,53 @@ def main():
                 )
                 logger.info("Loaded EMA weights from checkpoint (non-strict)")
 
-        # NOTE: We intentionally do NOT load optimizer state to reset momentum
-        logger.info("Optimizer state NOT loaded (momentum reset for fresh start)")
+        # Load optimizer state (完整恢复训练状态)
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            logger.info("Loaded optimizer state from checkpoint")
 
-        del checkpoint  # Free memory
+        # Restore training progress
+        start_iter = checkpoint.get("nb_iter", 0) + 1
+        best_cer = checkpoint.get("best_cer", 1e6)
+        best_wer = checkpoint.get("best_wer", 1e6)
+
+        logger.info(
+            f"✅ Resumed from Iter {start_iter}, Best CER: {best_cer:.4f}, Best WER: {best_wer:.4f}"
+        )
+
+        del checkpoint
+        torch.cuda.empty_cache()
+
+    elif os.path.exists(best_cer_path):
+        # Fallback: 从 best_CER.pth 恢复（只恢复模型权重）
+        logger.info(
+            f"Found best checkpoint at {best_cer_path}, loading weights only..."
+        )
+        checkpoint = torch.load(best_cer_path, map_location="cuda")
+
+        try:
+            model.load_state_dict(checkpoint["model"], strict=True)
+            logger.info("Loaded model weights from best_CER.pth (strict)")
+        except RuntimeError as e:
+            logger.warning(f"Strict loading failed: {e}")
+            model.load_state_dict(checkpoint["model"], strict=False)
+            logger.info("Loaded model weights from best_CER.pth (non-strict)")
+
+        if "state_dict_ema" in checkpoint:
+            try:
+                model_ema.ema.load_state_dict(checkpoint["state_dict_ema"], strict=True)
+            except RuntimeError:
+                model_ema.ema.load_state_dict(
+                    checkpoint["state_dict_ema"], strict=False
+                )
+            logger.info("Loaded EMA weights from best_CER.pth")
+
+        # NOTE: 从 best_CER.pth 恢复时不加载 optimizer，从头开始优化
+        logger.info(
+            "⚠️ Starting from iter 1 (optimizer state not loaded from best_CER.pth)"
+        )
+
+        del checkpoint
         torch.cuda.empty_cache()
     else:
         logger.info("No checkpoint found, starting training from scratch")
@@ -281,7 +330,8 @@ def main():
     #### ---- train & eval ---- ####
 
     # Create progress bar
-    pbar = tqdm(range(1, args.total_iter), desc="Training", unit="iter")
+    pbar = tqdm(range(start_iter, args.total_iter), desc="Training", unit="iter")
+    pbar.set_description(f"Training (from iter {start_iter})")
 
     for nb_iter in pbar:
         optimizer, current_lr = utils.update_lr_cos(
@@ -401,6 +451,22 @@ def main():
             train_loss = 0.0
             train_loss_ctc = 0.0
             train_loss_attn = 0.0
+
+        # === [Safety] Save Latest Checkpoint Periodically ===
+        save_latest_interval = getattr(args, "save_latest_interval", 1000)
+        if nb_iter % save_latest_interval == 0:
+            checkpoint = {
+                "model": model.state_dict(),
+                "state_dict_ema": model_ema.ema.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "nb_iter": nb_iter,
+                "best_cer": best_cer,
+                "best_wer": best_wer,
+            }
+            latest_path = os.path.join(args.save_dir, "latest.pth")
+            torch.save(checkpoint, latest_path)
+            logger.info(f"💾 Saved latest checkpoint to {latest_path} (iter {nb_iter})")
+        # ====================================================
 
         if nb_iter % args.eval_iter == 0:
             model.eval()
