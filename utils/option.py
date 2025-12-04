@@ -68,6 +68,20 @@ def get_args_parser():
     parser.add_argument('--ema-decay', default=0.9999, type=float, help='Exponential Moving Average (EMA) decay')
     parser.add_argument('--alpha', default=0, type=float, help='kld loss ratio')
 
+    # ABINet Language Model settings
+    parser.add_argument('--use-language-model', action='store_true', default=True, 
+                        help='Enable ABINet language model branch')
+    parser.add_argument('--no-language-model', action='store_false', dest='use_language_model',
+                        help='Disable language model, use CTC only')
+    parser.add_argument('--max-length', default=26, type=int, 
+                        help='Maximum sequence length for attention branch')
+    parser.add_argument('--lambda-ctc', default=1.0, type=float, 
+                        help='CTC loss weight')
+    parser.add_argument('--lambda-attn', default=1.0, type=float, 
+                        help='Visual attention loss weight')
+    parser.add_argument('--lambda-lang', default=1.0, type=float, 
+                        help='Language model loss weight')
+
     subparsers = parser.add_subparsers(title="dataset setting", dest="subcommand")
 
     IAM = subparsers.add_parser("IAM",

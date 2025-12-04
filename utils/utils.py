@@ -52,6 +52,7 @@ def update_lr_cos(nb_iter, warm_up_iter, total_iter, max_lr, optimizer, min_lr=1
 
 
 class CTCLabelConverter(object):
+    """CTC Loss 标签转换器"""
     def __init__(self, character):
         dict_character = list(character)
         self.dict = {}
@@ -82,6 +83,124 @@ class CTCLabelConverter(object):
 
             texts.append(text)
             index += l
+        return texts
+
+
+class AttnLabelConverter(object):
+    """
+    Attention-based Label Converter (for ABINet branch)
+    
+    与 CTC 不同，Attention 分支使用固定长度的输出，需要:
+    - EOS token 标记序列结束
+    - Padding 到固定长度
+    
+    字符映射:
+    - Index 0: [PAD] - padding token
+    - Index 1: [EOS] - end of sequence  
+    - Index 2+: 实际字符
+    
+    Args:
+        character: 字符列表或迭代器
+        max_length: 最大序列长度 (包含 EOS)
+    """
+    def __init__(self, character, max_length=26):
+        self.max_length = max_length
+        dict_character = list(character)
+        
+        # Special tokens
+        self.PAD_TOKEN = '[PAD]'
+        self.EOS_TOKEN = '[EOS]'
+        self.PAD_IDX = 0
+        self.EOS_IDX = 1
+        
+        # Build character list: [PAD], [EOS], char1, char2, ...
+        self.character = [self.PAD_TOKEN, self.EOS_TOKEN] + dict_character
+        
+        # Build encoding dict
+        self.dict = {}
+        for i, char in enumerate(dict_character):
+            self.dict[char] = i + 2  # +2 for PAD and EOS
+        
+        # Handle special characters that might be missing
+        if len(self.dict) == 87:
+            if '[' not in self.dict:
+                self.dict['['] = len(self.character)
+                self.character.append('[')
+            if ']' not in self.dict:
+                self.dict[']'] = len(self.character)
+                self.character.append(']')
+        
+        self.num_classes = len(self.character)
+
+    def encode(self, text_list):
+        """
+        将文本列表转换为固定长度的 tensor
+        
+        Args:
+            text_list: list of strings
+            
+        Returns:
+            targets: (B, max_length) LongTensor, 每个位置是字符索引
+                    序列末尾是 EOS，之后是 PAD
+            lengths: (B,) 实际长度 (包含 EOS)
+        """
+        batch_size = len(text_list)
+        targets = torch.full((batch_size, self.max_length), self.PAD_IDX, dtype=torch.long)
+        lengths = []
+        
+        for i, text in enumerate(text_list):
+            # Encode characters
+            text_indices = []
+            for char in text:
+                if char in self.dict:
+                    text_indices.append(self.dict[char])
+                else:
+                    # Skip unknown characters (or could map to UNK)
+                    pass
+            
+            # Truncate if too long (leave room for EOS)
+            if len(text_indices) > self.max_length - 1:
+                text_indices = text_indices[:self.max_length - 1]
+            
+            # Add EOS
+            text_indices.append(self.EOS_IDX)
+            length = len(text_indices)
+            lengths.append(length)
+            
+            # Fill tensor
+            targets[i, :length] = torch.LongTensor(text_indices)
+        
+        return targets.to(device), torch.LongTensor(lengths).to(device)
+
+    def decode(self, text_index, length=None):
+        """
+        将索引序列解码为字符串
+        
+        Args:
+            text_index: (B, T) tensor of indices, or (T,) for single sample
+            length: optional lengths tensor
+            
+        Returns:
+            list of decoded strings
+        """
+        if text_index.dim() == 1:
+            text_index = text_index.unsqueeze(0)
+        
+        batch_size = text_index.size(0)
+        texts = []
+        
+        for i in range(batch_size):
+            char_list = []
+            for idx in text_index[i]:
+                idx = idx.item()
+                if idx == self.EOS_IDX:
+                    break  # Stop at EOS
+                if idx == self.PAD_IDX:
+                    continue  # Skip PAD
+                if idx < len(self.character):
+                    char_list.append(self.character[idx])
+            texts.append(''.join(char_list))
+        
         return texts
 
 

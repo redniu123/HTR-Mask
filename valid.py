@@ -7,7 +7,13 @@ import editdistance
 
 
 def validation(model, criterion, evaluation_loader, converter):
-    """ validation or evaluation """
+    """ 
+    Validation or evaluation 
+    
+    支持两种模型输出格式:
+    1. Tensor: CTC-only 模式 (backward compatible)
+    2. Dict: Hybrid CTC + Attention 模式
+    """
 
     norm_ED = 0
     norm_ED_wer = 0
@@ -28,7 +34,17 @@ def validation(model, criterion, evaluation_loader, converter):
 
         text_for_loss, length_for_loss = converter.encode(labels)
 
-        preds = model(image)
+        # Forward pass
+        outputs = model(image)
+        
+        # Handle both dict and tensor outputs
+        if isinstance(outputs, dict):
+            # Hybrid mode: use CTC logits for validation
+            preds = outputs['ctc']
+        else:
+            # CTC-only mode
+            preds = outputs
+            
         preds = preds.float()
         preds_size = torch.IntTensor([preds.size(1)] * batch_size)
         preds = preds.permute(1, 0, 2).log_softmax(2)

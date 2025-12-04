@@ -5,6 +5,7 @@ from timm.models.vision_transformer import Mlp, DropPath
 
 import numpy as np
 from model import resnet18
+from model.abinet_layers import PositionAttention, BCNLanguage, GatedFusion
 from functools import partial
 
 
@@ -137,20 +138,29 @@ class LayerNorm(nn.Module):
 
 
 class MaskedAutoencoderViT(nn.Module):
-    """ Masked Autoencoder with VisionTransformer backbone
+    """ 
+    Masked Autoencoder with VisionTransformer backbone
+    
+    扩展版本: 支持 CTC + ABINet 语言模型双分支
     """
 
     def __init__(self,
                  nb_cls=80,
-                 img_size=[512, 32] ,
+                 img_size=[512, 32],
                  patch_size=[8, 32],
                  embed_dim=1024,
                  depth=24,
                  num_heads=16,
                  mlp_ratio=4.,
-                 norm_layer=nn.LayerNorm):
+                 norm_layer=nn.LayerNorm,
+                 max_length=26,
+                 use_language_model=True):
         super().__init__()
 
+        self.nb_cls = nb_cls
+        self.max_length = max_length
+        self.use_language_model = use_language_model
+        
         # --------------------------------------------------------------------------
         # MAE encoder specifics
         self.layer_norm = LayerNorm()
@@ -172,7 +182,39 @@ class MaskedAutoencoderViT(nn.Module):
             for i in range(depth)])
 
         self.norm = norm_layer(embed_dim, elementwise_affine=True)
+        
+        # --------------------------------------------------------------------------
+        # Branch 1: CTC Head
         self.head = torch.nn.Linear(embed_dim, nb_cls)
+        
+        # --------------------------------------------------------------------------
+        # Branch 2: ABINet Language Branch (Optional)
+        if self.use_language_model:
+            # Position Attention: 将 ViT 特征 (B, 128, 768) 转换为固定长度 (B, max_length, 768)
+            self.pos_attn = PositionAttention(
+                max_length=max_length,
+                in_channels=embed_dim,
+                num_channels=64
+            )
+            # Visual head for position attention output
+            self.vis_cls = nn.Linear(embed_dim, nb_cls)
+            
+            # BCN Language Model
+            self.language_model = BCNLanguage(
+                num_classes=nb_cls,
+                max_length=max_length,
+                d_model=512,  # Language model dimension
+                nhead=8,
+                d_inner=2048,
+                dropout=0.1,
+                num_layers=4,
+                detach=True  # Detach visual input for stable training
+            )
+            
+            # Gated Fusion (optional, can use simple residual)
+            self.use_gated_fusion = False
+            if self.use_gated_fusion:
+                self.fusion = GatedFusion(d_model=nb_cls)
 
         self.initialize_weights()
 
@@ -266,30 +308,79 @@ class MaskedAutoencoderViT(nn.Module):
         return x_masked
 
     def forward(self, x, mask_ratio=0.0, max_span_length=1, use_masking=False):
+        """
+        Forward pass with optional language model branch
+        
+        Args:
+            x: Input image (B, 1, H, W)
+            mask_ratio: Mask ratio for span masking
+            max_span_length: Maximum span length for masking
+            use_masking: Whether to apply masking (training only)
+            
+        Returns:
+            dict with:
+                - 'ctc': (B, L, C) CTC logits, L=128
+                - 'attn': (B, T, C) Attention logits, T=max_length (if use_language_model)
+                - 'vis_logits': (B, T, C) Visual logits before language model
+                - 'lang_logits': (B, T, C) Language model logits
+        """
         # embed patches
         x = self.layer_norm(x)
         x = self.patch_embed(x)  # (B, C, H', W') = (B, embed_dim, 1, 128)
-        b, c, h, w = x.shape  # 修复变量命名：应该是 h, w 而不是 w, h
+        b, c, h, w = x.shape
         x = x.view(b, c, -1).permute(0, 2, 1)  # (B, L, C) where L = H' * W' = 128
+        
         # masking: length -> length * mask_ratio
         if use_masking:
             x = self.random_masking(x, mask_ratio, max_span_length)
         x = x + self.pos_embed
+        
         # apply Transformer blocks
         for blk in self.blocks:
             x = blk(x)
 
-        x = self.norm(x)
-        # To CTC Loss
-        x = self.head(x)
-        x = self.layer_norm(x)
+        visual_feat = self.norm(x)  # (B, 128, 768) - ViT encoder output
+        
+        # --------------------------------------------------------------------------
+        # Branch 1: CTC
+        ctc_logits = self.head(visual_feat)  # (B, 128, nb_cls)
+        ctc_logits = self.layer_norm(ctc_logits)
+        
+        # --------------------------------------------------------------------------
+        # Branch 2: ABINet Language Branch
+        if self.use_language_model:
+            # Position Attention: (B, 128, 768) -> (B, max_length, 768)
+            attn_vecs, attn_scores = self.pos_attn(visual_feat)  # (B, T, E)
+            
+            # Visual classification
+            vis_logits = self.vis_cls(attn_vecs)  # (B, T, nb_cls)
+            
+            # Language Model: refine using BCN
+            vis_probs = torch.softmax(vis_logits, dim=-1)  # (B, T, nb_cls)
+            lang_output = self.language_model(vis_probs)  # dict with 'logits'
+            lang_logits = lang_output['logits']  # (B, T, nb_cls)
+            
+            # Fusion: simple residual or gated
+            if self.use_gated_fusion:
+                fused_logits = self.fusion(vis_logits, lang_logits)
+            else:
+                # Simple residual fusion
+                fused_logits = vis_logits + lang_logits
+            
+            return {
+                'ctc': ctc_logits,           # (B, 128, C) for CTC loss
+                'attn': fused_logits,        # (B, T, C) for CE loss (final output)
+                'vis_logits': vis_logits,    # (B, T, C) visual logits
+                'lang_logits': lang_logits,  # (B, T, C) language logits
+            }
+        else:
+            # CTC only mode (backward compatible)
+            return ctc_logits
 
-        return x
 
-
-def create_model(nb_cls, img_size, **kwargs):
+def create_model(nb_cls, img_size, max_length=26, use_language_model=True, **kwargs):
     """
-    创建 HTR-VT 模型
+    创建 HTR-VT 模型 (支持 CTC + ABINet 语言模型双分支)
     
     根据论文 Li et al., 2025 的规范:
     - embed_dim = 768
@@ -298,13 +389,24 @@ def create_model(nb_cls, img_size, **kwargs):
     - mlp_ratio = 4 (Hidden dim = 3072)
     - 2D Sin-Cos positional embedding (Fixed)
     
+    新增 ABINet 语言分支:
+    - PositionAttention: 将变长视觉特征转为固定长度
+    - BCNLanguage: 双向完形填空网络进行语言建模
+    
     Args:
         nb_cls: 类别数量 (字符表大小 + 1 for CTC blank)
         img_size: [H, W] 图像尺寸，默认 [64, 512]
+        max_length: 最大序列长度 (ABINet 分支输出长度)
+        use_language_model: 是否启用语言模型分支
+        
+    Returns:
+        model: MaskedAutoencoderViT instance
         
     Notes:
         - patch_size=(4, 64) 表示 W 方向下采样 4 倍，H 方向压缩到 1
         - ResNet 输出 L=128 个 tokens (512/4=128)
+        - 当 use_language_model=True 时，forward 返回 dict
+        - 当 use_language_model=False 时，forward 返回 tensor (向后兼容)
     """
     model = MaskedAutoencoderViT(nb_cls,
                                  img_size=img_size,
@@ -314,6 +416,8 @@ def create_model(nb_cls, img_size, **kwargs):
                                  num_heads=6,
                                  mlp_ratio=4,
                                  norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                                 max_length=max_length,
+                                 use_language_model=use_language_model,
                                  **kwargs)
     return model
 
