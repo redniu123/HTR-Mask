@@ -161,28 +161,8 @@ def main():
     writer = SummaryWriter(args.save_dir)
 
     # ============================================================
-    # Model Configuration
+    # Load Datasets First (needed for vocabulary)
     # ============================================================
-    max_length = getattr(args, "max_length", 26)  # 默认最大序列长度
-    use_language_model = getattr(args, "use_language_model", True)  # 是否使用语言模型
-
-    model = HTR_VT.create_model(
-        nb_cls=args.nb_cls,
-        img_size=args.img_size[::-1],
-        max_length=max_length,
-        use_language_model=use_language_model,
-    )
-
-    total_param = sum(p.numel() for p in model.parameters())
-    logger.info(f"Total parameters: {total_param:,}")
-    logger.info(f"Language Model: {'Enabled' if use_language_model else 'Disabled'}")
-    logger.info(f"Max sequence length: {max_length}")
-
-    model.train()
-    model = model.cuda()
-    model_ema = utils.ModelEma(model, args.ema_decay)
-    model.zero_grad()
-
     logger.info("Loading train loader...")
     train_dataset = dataset.myLoadDS(
         args.train_data_list, args.data_path, args.img_size
@@ -209,22 +189,17 @@ def main():
         num_workers=args.num_workers,
     )
 
-    optimizer = sam.SAM(
-        model.parameters(),
-        torch.optim.AdamW,
-        lr=1e-7,
-        betas=(0.9, 0.99),
-        weight_decay=args.weight_decay,
-    )
+    # ============================================================
+    # Initialize Converters & Determine Vocabulary Size
+    # ============================================================
+    max_length = getattr(args, "max_length", 26)  # 默认最大序列长度
+    use_language_model = getattr(args, "use_language_model", True)  # 是否使用语言模型
 
-    # ============================================================
-    # Loss Functions & Converters
-    # ============================================================
-    # CTC Loss & Converter
+    # CTC Converter
     ctc_criterion = torch.nn.CTCLoss(reduction="none", zero_infinity=True)
     ctc_converter = utils.CTCLabelConverter(train_dataset.ralph.values())
 
-    # Attention Loss & Converter (for language model branch)
+    # Attention Converter (for language model branch)
     attn_converter = None
     if use_language_model:
         attn_converter = utils.AttnLabelConverter(
@@ -233,6 +208,47 @@ def main():
         logger.info(
             f"AttnLabelConverter initialized with {attn_converter.num_classes} classes"
         )
+
+        # === [Fix] Dynamic Class Number Adjustment ===
+        # ABINet branch needs more classes ([PAD], [EOS]) than CTC ([blank])
+        # We must ensure model embedding size covers the largest vocabulary
+        real_nb_cls = attn_converter.num_classes
+        if real_nb_cls > args.nb_cls:
+            logger.info(
+                f"⚠️ Auto-adjusting nb_cls from {args.nb_cls} to {real_nb_cls} "
+                f"to fit Attention Branch vocabulary"
+            )
+            args.nb_cls = real_nb_cls
+        # =============================================
+
+    # ============================================================
+    # Create Model (AFTER vocabulary size is determined)
+    # ============================================================
+    model = HTR_VT.create_model(
+        nb_cls=args.nb_cls,
+        img_size=args.img_size[::-1],
+        max_length=max_length,
+        use_language_model=use_language_model,
+    )
+
+    total_param = sum(p.numel() for p in model.parameters())
+    logger.info(f"Total parameters: {total_param:,}")
+    logger.info(f"Language Model: {'Enabled' if use_language_model else 'Disabled'}")
+    logger.info(f"Max sequence length: {max_length}")
+    logger.info(f"Number of classes (nb_cls): {args.nb_cls}")
+
+    model.train()
+    model = model.cuda()
+    model_ema = utils.ModelEma(model, args.ema_decay)
+    model.zero_grad()
+
+    optimizer = sam.SAM(
+        model.parameters(),
+        torch.optim.AdamW,
+        lr=1e-7,
+        betas=(0.9, 0.99),
+        weight_decay=args.weight_decay,
+    )
 
     best_cer, best_wer = 1e6, 1e6
     train_loss = 0.0
