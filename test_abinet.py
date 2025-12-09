@@ -8,24 +8,63 @@ Usage:
     python test_abinet.py --exp-name iam IAM
 """
 
-import torch
-import torch.utils.data
-
+import logging
 import os
 import re
 import json
-import editdistance
+from typing import List, Tuple
 from collections import OrderedDict
 
-from utils import utils
-from utils import option
+import editdistance
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+
+from utils import option, utils
 from data import dataset
 from model import HTR_VT
 
 
+def decode_attn_indices(
+    indices: torch.Tensor, converter: utils.AttnLabelConverter
+) -> List[str]:
+    """
+    将索引序列解码为字符串，忽略 <GO>/<PAD>，遇到 <EOS> 即停止。
+
+    Args:
+        indices: [B, T] 或 [T] 的索引张量
+        converter: Attention 标签转换器
+
+    Returns:
+        List[str]: 预测文本列表
+    """
+    if indices.dim() == 1:
+        indices = indices.unsqueeze(0)
+
+    pad_idx = getattr(converter, "PAD_IDX", 0)
+    eos_idx = getattr(converter, "EOS_IDX", 1)
+    go_idx = getattr(converter, "GO_IDX", None)
+    char_list = getattr(converter, "character", [])
+
+    pred_strs: List[str] = []
+    for idx_seq in indices:
+        chars: List[str] = []
+        for idx in idx_seq:
+            token = int(idx.item())
+            if token == eos_idx:
+                break
+            if token == pad_idx or (go_idx is not None and token == go_idx):
+                continue
+            if 0 <= token < len(char_list):
+                chars.append(char_list[token])
+        pred_strs.append("".join(chars))
+
+    return pred_strs
+
+
 def greedy_decode_attn(
     attn_logits: torch.Tensor, converter: utils.AttnLabelConverter
-) -> list:
+) -> List[str]:
     """
     Greedy decoding for Attention logits
 
@@ -37,15 +76,18 @@ def greedy_decode_attn(
         list of decoded strings
     """
     # Greedy: take argmax at each position
-    preds = attn_logits.argmax(dim=-1)  # (B, T)
+    preds = attn_logits.argmax(dim=-1)  # [B, T]
 
-    # Use converter's decode method
-    pred_strs = converter.decode(preds)
-
-    return pred_strs
+    return decode_attn_indices(preds, converter)
 
 
-def evaluate_attention_branch(model, test_loader, attn_converter, logger):
+def evaluate_attention_branch(
+    model: nn.Module,
+    test_loader: DataLoader,
+    attn_converter: utils.AttnLabelConverter,
+    device: torch.device,
+    logger: logging.Logger,
+) -> Tuple[float, float, List[str], List[str]]:
     """
     Evaluate the Attention/Language branch of the model
 
@@ -53,6 +95,7 @@ def evaluate_attention_branch(model, test_loader, attn_converter, logger):
         model: HTR-VT model with use_language_model=True
         test_loader: DataLoader for test set
         attn_converter: AttnLabelConverter instance
+        device: torch device
         logger: Logger instance
 
     Returns:
@@ -75,8 +118,7 @@ def evaluate_attention_branch(model, test_loader, attn_converter, logger):
 
     with torch.no_grad():
         for batch_idx, (image_tensors, labels) in enumerate(test_loader):
-            batch_size = image_tensors.size(0)
-            images = image_tensors.cuda()
+            images = image_tensors.to(device)  # [B, 1, 64, 512]
 
             # Forward pass
             outputs = model(images)
@@ -87,9 +129,11 @@ def evaluate_attention_branch(model, test_loader, attn_converter, logger):
                     "Model output is not a dict. "
                     "Make sure model was created with use_language_model=True"
                 )
+            if "attn" not in outputs:
+                raise KeyError("Model output dict must contain key 'attn'")
 
             # Extract attention logits
-            attn_logits = outputs["attn"]  # (B, T, C)
+            attn_logits = outputs["attn"]  # [B, T, C]
 
             # Greedy decode
             preds_str = greedy_decode_attn(attn_logits, attn_converter)
@@ -124,7 +168,7 @@ def evaluate_attention_branch(model, test_loader, attn_converter, logger):
     return cer, wer, all_preds, all_labels
 
 
-def main():
+def main() -> None:
     args = option.get_args_parser()
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -237,7 +281,7 @@ def main():
     # Evaluate Attention Branch
     # ============================================================
     cer, wer, preds, labels = evaluate_attention_branch(
-        model, test_loader, attn_converter, logger
+        model, test_loader, attn_converter, device, logger
     )
 
     # ============================================================
@@ -246,6 +290,7 @@ def main():
     logger.info("=" * 60)
     logger.info("📊 Attention Branch Results")
     logger.info("=" * 60)
+    logger.info(f"Attention Branch CER: {cer:.4f} \t WER: {wer:.4f}")
     logger.info(f"  CER: {cer:.4f} ({cer * 100:.2f}%)")
     logger.info(f"  WER: {wer:.4f} ({wer * 100:.2f}%)")
     logger.info("=" * 60)
@@ -256,30 +301,6 @@ def main():
         logger.info(f"  [{i + 1}] GT:   '{labels[i]}'")
         logger.info(f"       Pred: '{preds[i]}'")
         logger.info("")
-
-    # Also evaluate CTC branch for comparison
-    logger.info("\n--- For Comparison: CTC Branch ---")
-    ctc_converter = utils.CTCLabelConverter(train_dataset.ralph.values())
-    criterion = torch.nn.CTCLoss(reduction="none", zero_infinity=True).to(device)
-
-    # Quick CTC evaluation (reusing valid.validation)
-    import valid
-
-    with torch.no_grad():
-        ctc_loss, ctc_cer, ctc_wer, _, _ = valid.validation(
-            model, criterion, test_loader, ctc_converter
-        )
-
-    logger.info(f"  CTC Branch CER: {ctc_cer:.4f} ({ctc_cer * 100:.2f}%)")
-    logger.info(f"  CTC Branch WER: {ctc_wer:.4f} ({ctc_wer * 100:.2f}%)")
-    logger.info("=" * 60)
-
-    # Summary comparison
-    logger.info("\n📈 Summary Comparison:")
-    logger.info(f"  {'Branch':<15} {'CER':>10} {'WER':>10}")
-    logger.info(f"  {'-' * 35}")
-    logger.info(f"  {'Attention':<15} {cer * 100:>9.2f}% {wer * 100:>9.2f}%")
-    logger.info(f"  {'CTC':<15} {ctc_cer * 100:>9.2f}% {ctc_wer * 100:>9.2f}%")
 
 
 if __name__ == "__main__":
